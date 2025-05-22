@@ -24,19 +24,11 @@ class MergeEnv(AbstractEnv):
     def default_config(cls) -> dict:
         cfg = super().default_config()
         cfg.update({
-            "observation": {
-                "type": "Kinematics"},
-
-            "action": {
-                "type": "DiscreteMetaAction",
-                "longitudinal": True,
-                "lateral": True},
-
-            "collision_reward": -10, 
-            "merge_reward": 10,                  # successful merging indicator
-            "time_cost_reward": -0.1,             # penalty for each time step when the car did not merge
-            "reward_speed_range": [20, 30],
-            "speed_reward": 0.2
+            "collision_reward": -1,
+            "right_lane_reward": 0.1,
+            "high_speed_reward": 0.2,
+            "merging_speed_reward": -0.5,
+            "lane_change_reward": -0.05,
         })
         return cfg
 
@@ -51,34 +43,25 @@ class MergeEnv(AbstractEnv):
         """
         reward = sum(self.config.get(name, 0) * reward for name, reward in self._rewards(action).items())
         return utils.lmap(reward,
-                          [self.config["collision_reward"] + self.config["merge_reward"],
-                           self.config["time_cost_reward"] + self.config["speed_reward"]],
+                          [self.config["collision_reward"] + self.config["merging_speed_reward"],
+                           self.config["high_speed_reward"] + self.config["right_lane_reward"]],
                           [0, 1])
 
     def _rewards(self, action: int) -> Dict[Text, float]:
-        #scaled_speed = utils.lmap(self.vehicle.speed, self.config["reward_speed_range"], [0, 1])
         return {
             "collision_reward": self.vehicle.crashed,
-            "merge_reward": self._is_success(),
-            "time_cost_reward": -0.1,
-            "speed_reward": sum(  # Altruistic penalty
+            "right_lane_reward": self.vehicle.lane_index[2] / 1,
+            "high_speed_reward": self.vehicle.speed_index / (self.vehicle.target_speeds.size - 1),
+            "lane_change_reward": action in [0, 2],
+            "merging_speed_reward": sum(  # Altruistic penalty
                 (vehicle.target_speed - vehicle.speed) / vehicle.target_speed
                 for vehicle in self.road.vehicles
                 if vehicle.lane_index == ("b", "c", 2) and isinstance(vehicle, ControlledVehicle)
             )
         }
 
-    def _is_success(self):
-        lane_index = self.vehicle.target_lane_index if isinstance(self.vehicle, ControlledVehicle) \
-            else self.vehicle.lane_index
-        # need to define lane index here
-        goal_reached = lane_index == ("1", "2", self.config["lanes_count"]) or lane_index == ("2", "exit", 0)
-        return goal_reached
-
     def _is_terminated(self) -> bool:
         """The episode is over when a collision occurs or when the access ramp has been passed."""
-        print("crash" + str(self.vehicle.crashed))
-        print("over"  + str(self.vehicle.position[0] > 370))
         return self.vehicle.crashed or bool(self.vehicle.position[0] > 370)
 
     def _is_truncated(self) -> bool:
@@ -120,28 +103,83 @@ class MergeEnv(AbstractEnv):
         road = Road(network=net, np_random=self.np_random, record_history=self.config["show_trajectories"])
         road.objects.append(Obstacle(road, lbc.position(ends[2], 0)))
         self.road = road
-
-    def _make_vehicles(self) -> None:
+#num_CAV = 4, num_HDV = 3
+    def _make_vehicles(self, num_CAV=1, num_HDV=10) -> None:
         """
         Populate a road with several vehicles on the highway and on the merging lane, as well as an ego-vehicle.
-
         :return: the ego-vehicle
         """
         road = self.road
-        ego_vehicle = self.action_type.vehicle_class(road,
-                                                     road.network.get_lane(("j", "k", 0)).position(30, 0),
-                                                     speed=30)
-        road.vehicles.append(ego_vehicle)
-
         other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+        self.controlled_vehicles = []
 
-        for position, speed in [(90, 29), (70, 31), (5, 31.5)]:
-            lane = road.network.get_lane(("a", "b", self.np_random.integers(2)))
-            position = lane.position(position + self.np_random.uniform(-5, 5), 0)
-            speed += self.np_random.uniform(-1, 1)
-            road.vehicles.append(other_vehicles_type(road, position, speed=speed))
+        spawn_points_s = [10, 50, 90, 130, 170, 210]
+        spawn_points_m = [5, 45, 85, 125, 165, 205]
 
-        #merging_v = other_vehicles_type(road, road.network.get_lane(("j", "k", 0)).position(110, 0), speed=20)
-        #merging_v.target_speed = 30
-        #road.vehicles.append(merging_v)
-        #self.vehicle = ego_vehicle
+        """Spawn points for CAV"""
+        # spawn point indexes on the straight road
+        spawn_point_s_c = np.random.choice(spawn_points_s, num_CAV // 2, replace=False)
+        # spawn point indexes on the merging road
+        spawn_point_m_c = np.random.choice(spawn_points_m, num_CAV - num_CAV // 2,
+                                           replace=False)
+        spawn_point_s_c = list(spawn_point_s_c)
+        spawn_point_m_c = list(spawn_point_m_c)
+        # remove the points to avoid duplicate
+        for a in spawn_point_s_c:
+            spawn_points_s.remove(a)
+        for b in spawn_point_m_c:
+            spawn_points_m.remove(b)
+
+        """Spawn points for HDV"""
+        # spawn point indexes on the straight road
+        spawn_point_s_h = np.random.choice(spawn_points_s, num_HDV // 2, replace=False)
+        # spawn point indexes on the merging road
+        spawn_point_m_h = np.random.choice(spawn_points_m, num_HDV - num_HDV // 2,
+                                           replace=False)
+        spawn_point_s_h = list(spawn_point_s_h)
+        spawn_point_m_h = list(spawn_point_m_h)
+
+        # initial speed with noise and location noise
+        initial_speed = np.random.rand(num_CAV + num_HDV) * 2 + 25  # range from [25, 27]
+        loc_noise = np.random.rand(num_CAV + num_HDV) * 3 - 1.5  # range from [-1.5, 1.5]
+        initial_speed = list(initial_speed)
+        loc_noise = list(loc_noise)
+
+        """spawn the CAV on the straight road first"""
+        '''
+        for _ in range(num_CAV // 2):
+            ego_vehicle = self.action_type.vehicle_class(road, road.network.get_lane(("a", "b", 0)).position(
+                spawn_point_s_c.pop(0) + loc_noise.pop(0), 0), speed=initial_speed.pop(0))
+            self.controlled_vehicles.append(ego_vehicle)
+            road.vehicles.append(ego_vehicle)
+        '''
+        
+        """spawn the rest CAV on the merging road"""
+        for _ in range(num_CAV):
+            ego_vehicle = self.action_type.vehicle_class(road, road.network.get_lane(("j", "k", 0)).position(
+                spawn_point_m_c.pop(0) + loc_noise.pop(0), 0), speed=initial_speed.pop(0))
+            self.controlled_vehicles.append(ego_vehicle)
+            road.vehicles.append(ego_vehicle)
+
+        """spawn the HDV on the main road first"""
+        for _ in range(num_HDV):
+            road.vehicles.append(
+                other_vehicles_type(road, road.network.get_lane(("a", "b", 0)).position(
+                    spawn_point_s_h.pop(0) + loc_noise.pop(0), 0),
+                                    speed=initial_speed.pop(0)))
+
+        """spawn the rest HDV on the merging road"""
+        '''
+        for _ in range(num_HDV - num_HDV // 2):
+            road.vehicles.append(
+                other_vehicles_type(road, road.network.get_lane(("j", "k", 0)).position(
+                    spawn_point_m_h.pop(0) + loc_noise.pop(0), 0),
+                                    speed=initial_speed.pop(0)))
+        '''
+
+    def terminate(self):
+        return
+
+    def init_test_seeds(self, test_seeds):
+        self.test_num = len(test_seeds)
+        self.test_seeds = test_seeds
