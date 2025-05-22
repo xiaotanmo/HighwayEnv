@@ -103,6 +103,7 @@ class MergeEnv(AbstractEnv):
         road = Road(network=net, np_random=self.np_random, record_history=self.config["show_trajectories"])
         road.objects.append(Obstacle(road, lbc.position(ends[2], 0)))
         self.road = road
+        
 #num_CAV = 4, num_HDV = 3
     def _make_vehicles(self, num_CAV=1, num_HDV=10) -> None:
         """
